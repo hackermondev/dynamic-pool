@@ -1,109 +1,119 @@
 use crossbeam_queue::ArrayQueue;
+use dashmap::DashMap;
 use std::fmt::{Debug, Formatter};
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, SystemTime};
 
+use crate::expiration::ExpiringItem;
 use crate::DynamicReset;
 
-/// a lock-free, thread-safe, dynamically-sized object pool.
-///
-/// this pool begins with an initial capacity and will continue creating new objects on request when none are available.
-/// pooled objects are returned to the pool on destruction (with an extra provision to optionally "reset" the state of
-/// an object for re-use).
-///
-/// if, during an attempted return, a pool already has `maximum_capacity` objects in the pool, the pool will throw away
-/// that object.
+#[derive(Debug, Default)]
+pub struct DynamicPoolConfig {
+    pub max_capacity: usize,
+    pub time_to_live: Option<Duration>,
+}
+
+impl DynamicPoolConfig {
+    pub fn with_max_capacity(mut self, max_capacity: usize) -> Self {
+        self.max_capacity = max_capacity;
+        self
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.time_to_live = Some(ttl);
+        self
+    }
+}
+
 #[derive(Debug)]
-pub struct DynamicPool<T: DynamicReset> {
-    data: Arc<PoolData<T>>,
+pub struct DynamicPool<K: Eq + Hash, T: DynamicReset> {
+    inner: Arc<DashMap<K, Arc<PoolData<T>>>>,
+    config: Arc<DynamicPoolConfig>,
 }
 
-impl<T: DynamicReset> DynamicPool<T> {
-    /// creates a new `DynamicPool<T>`. this pool will create `initial_capacity` objects, and retain up to
-    /// `maximum_capacity` objects.
-    ///
-    /// # panics.
-    ///
-    /// panics if `initial_capacity > maximum_capacity`.
-    pub fn new<F: Fn() -> T + Sync + Send + 'static>(
-        initial_capacity: usize,
-        maximum_capacity: usize,
-        create: F,
-    ) -> DynamicPool<T> {
-        assert![initial_capacity <= maximum_capacity];
-
-        let items = ArrayQueue::new(maximum_capacity);
-
-        for x in (0..initial_capacity).map(|_| create()) {
-            items
-                .push(x)
-                .expect("invariant: items.len() always less than initial_capacity.");
-        }
-
-        let data = PoolData {
-            items,
-            create: Box::new(create),
-        };
-        let data = Arc::new(data);
-
-        DynamicPool { data }
-    }
-
-    /// takes an item from the pool, creating one if none are available.
-    pub fn take(&self) -> DynamicPoolItem<T> {
-        let object = self
-            .data
-            .items
-            .pop()
-            .unwrap_or_else(|_| (self.data.create)());
-
-        DynamicPoolItem {
-            data: Arc::downgrade(&self.data),
-            object: Some(object),
+impl<K: Eq + Hash, T: DynamicReset + 'static + Send> DynamicPool<K, T> {
+    /// creates a new `DynamicPool<T>`.
+    pub fn new(config: DynamicPoolConfig) -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+            config: Arc::new(config),
         }
     }
 
-    /// attempts to take an item from the pool, returning `none` if none is available. will never allocate.
-    pub fn try_take(&self) -> Option<DynamicPoolItem<T>> {
-        let object = self.data.items.pop().ok()?;
-        let data = Arc::downgrade(&self.data);
+    pub fn insert(&self, k: K, item: T) -> Result<(), T> {
+        let pool = self.inner.entry(k).or_insert_with(|| {
+            Arc::new(PoolData {
+                items: ArrayQueue::new(self.config.max_capacity),
+            })
+        });
 
-        Some(DynamicPoolItem {
-            data,
-            object: Some(object),
-        })
+        let expiration = self
+            .config
+            .time_to_live
+            .as_ref()
+            .map(|ttl| SystemTime::now() + *ttl);
+        let item = ExpiringItem::new(item, expiration);
+        pool.items.push(item).map_err(|e| e.0.take().unwrap())
     }
 
-    /// returns the number of free objects in the pool.
-    #[inline]
-    pub fn available(&self) -> usize {
-        self.data.items.len()
+    /// attempts to take an item from a pool, returning `none` if none is available. will never allocate.
+    pub fn try_take(&self, k: &K) -> Option<DynamicPoolItem<T>> {
+        let pool = self.inner.get(k)?;
+        loop {
+            let object = pool.items.pop().ok()?;
+            let object = object.take();
+            if object.is_none() {
+                continue;
+            }
+
+            let object = object.unwrap();
+            let data = Arc::downgrade(&pool);
+            return Some(DynamicPoolItem {
+                data,
+                object: Some(object),
+                config: self.config.clone(),
+            });
+        }
     }
 
-    /// returns the number of objects currently in use. does not include objects that have been detached.
+    /// returns the number of objects currently in use in a pool. does not include objects that have been detached.
     #[inline]
-    pub fn used(&self) -> usize {
-        Arc::weak_count(&self.data)
+    pub fn used(&self, k: &K) -> usize {
+        let pool = self.inner.get(k);
+        if pool.is_none() {
+            return 0;
+        }
+
+        let pool = pool.unwrap();
+        Arc::weak_count(&pool)
     }
 
     #[inline]
-    pub fn capacity(&self) -> usize {
-        self.data.items.capacity()
+    pub fn capacity(&self, k: &K) -> usize {
+        let pool = self.inner.get(k);
+        if pool.is_none() {
+            return 0;
+        }
+
+        let pool = pool.unwrap();
+        pool.items.capacity()
     }
 }
 
-impl<T: DynamicReset> Clone for DynamicPool<T> {
+impl<K: Eq + Hash + Clone, T: DynamicReset> Clone for DynamicPool<K, T> {
     fn clone(&self) -> Self {
         Self {
-            data: self.data.clone(),
+            inner: self.inner.clone(),
+            config: self.config.clone(),
         }
     }
 }
 
 // data shared by a `DynamicPool`.
 struct PoolData<T> {
-    items: ArrayQueue<T>,
-    create: Box<dyn Fn() -> T + Sync + Send + 'static>,
+    items: ArrayQueue<ExpiringItem<T>>,
 }
 
 impl<T: DynamicReset + Debug> Debug for PoolData<T> {
@@ -111,19 +121,19 @@ impl<T: DynamicReset + Debug> Debug for PoolData<T> {
         formatter
             .debug_struct("PoolData")
             .field("items", &self.items)
-            .field("create", &"Box<dyn Fn() -> T>")
             .finish()
     }
 }
 
 /// an object, checked out from a dynamic pool object.
 #[derive(Debug)]
-pub struct DynamicPoolItem<T: DynamicReset> {
+pub struct DynamicPoolItem<T: DynamicReset + 'static + Send> {
     data: Weak<PoolData<T>>,
     object: Option<T>,
+    config: Arc<DynamicPoolConfig>,
 }
 
-impl<T: DynamicReset> DynamicPoolItem<T> {
+impl<T: DynamicReset + 'static + Send> DynamicPoolItem<T> {
     /// detaches this instance from the pool, returns T.
     pub fn detach(mut self) -> T {
         self.object
@@ -132,7 +142,7 @@ impl<T: DynamicReset> DynamicPoolItem<T> {
     }
 }
 
-impl<T: DynamicReset> AsRef<T> for DynamicPoolItem<T> {
+impl<T: DynamicReset + 'static + Send> AsRef<T> for DynamicPoolItem<T> {
     fn as_ref(&self) -> &T {
         self.object
             .as_ref()
@@ -140,7 +150,7 @@ impl<T: DynamicReset> AsRef<T> for DynamicPoolItem<T> {
     }
 }
 
-impl<T: DynamicReset> Deref for DynamicPoolItem<T> {
+impl<T: DynamicReset + 'static + Send> Deref for DynamicPoolItem<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -150,7 +160,7 @@ impl<T: DynamicReset> Deref for DynamicPoolItem<T> {
     }
 }
 
-impl<T: DynamicReset> DerefMut for DynamicPoolItem<T> {
+impl<T: DynamicReset + 'static + Send> DerefMut for DynamicPoolItem<T> {
     fn deref_mut(&mut self) -> &mut T {
         self.object
             .as_mut()
@@ -158,11 +168,17 @@ impl<T: DynamicReset> DerefMut for DynamicPoolItem<T> {
     }
 }
 
-impl<T: DynamicReset> Drop for DynamicPoolItem<T> {
+impl<T: DynamicReset + 'static + Send> Drop for DynamicPoolItem<T> {
     fn drop(&mut self) {
         if let Some(mut object) = self.object.take() {
             object.reset();
             if let Some(pool) = self.data.upgrade() {
+                let expiration = self
+                    .config
+                    .time_to_live
+                    .as_ref()
+                    .map(|ttl| SystemTime::now() + *ttl);
+                let object = ExpiringItem::new(object, expiration);
                 pool.items.push(object).ok();
             }
         }

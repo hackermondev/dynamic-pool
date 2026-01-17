@@ -1,3 +1,7 @@
+use std::ops::{Deref, DerefMut};
+
+pub struct NoopDynamicReset<T>(T);
+
 pub trait DynamicReset {
     fn reset(&mut self);
 }
@@ -182,5 +186,23 @@ where
         self.7.reset();
         self.8.reset();
         self.9.reset();
+    }
+}
+
+impl<T> DynamicReset for NoopDynamicReset<T> {
+    fn reset(&mut self) {}
+}
+
+impl<T> Deref for NoopDynamicReset<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for NoopDynamicReset<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
