@@ -78,6 +78,10 @@ impl<K: Eq + Hash, T: DynamicReset + 'static + Send> DynamicPool<K, T> {
         }
     }
 
+    pub fn remove(&self, k: &K) {
+        self.inner.remove(k);
+    }
+
     /// returns the number of objects currently in use in a pool. does not include objects that have been detached.
     #[inline]
     pub fn used(&self, k: &K) -> usize {
